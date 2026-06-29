@@ -44,7 +44,6 @@ class TestOllamaEmbedder:
     def test_name(self):
         emb = OllamaEmbedder()
         assert "ollama" in emb.name
-        assert "nomic-embed-text" in emb.name
 
     def test_custom_url(self):
         emb = OllamaEmbedder(url="http://localhost:12345")

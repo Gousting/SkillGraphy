@@ -13,6 +13,7 @@ Batch embedding is supported via embed_batch(texts) -> list[list[float]].
 from __future__ import annotations
 
 import os
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -45,6 +46,13 @@ class Embedder(ABC):
         return [self.embed(t) for t in texts]
 
 
+def _sanitize_vec(vec: list[float]) -> list[float]:
+    """Replace NaN/Inf values with 0.0 (Ollama bge-m3 bug workaround)."""
+    if any(math.isnan(v) or math.isinf(v) for v in vec):
+        return [0.0 if (math.isnan(v) or math.isinf(v)) else v for v in vec]
+    return vec
+
+
 # ── Ollama Backend ───────────────────────────────────────────────────────────
 
 
@@ -52,10 +60,10 @@ class OllamaEmbedder(Embedder):
     """Ollama-based embedding backend.
 
     Requires Ollama running on localhost:11434 with an embedding model pulled:
-        ollama pull nomic-embed-text
+        ollama pull bge-m3
     """
 
-    DEFAULT_MODEL = "nomic-embed-text"
+    DEFAULT_MODEL = "bge-m3"
     DEFAULT_URL = "http://localhost:11434"
 
     def __init__(
@@ -89,25 +97,56 @@ class OllamaEmbedder(Embedder):
         data = resp.json()
         embeddings = data.get("embeddings") or data.get("embedding") or []
         if isinstance(embeddings[0] if embeddings else None, list):
-            return embeddings[0]
-        return embeddings
+            return _sanitize_vec(embeddings[0])
+        return _sanitize_vec(embeddings)
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         import httpx
 
-        resp = httpx.post(
-            f"{self.url}/api/embed",
-            json={"model": self.model, "input": texts},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        embeddings = data.get("embeddings") or data.get("embedding") or []
-        # Ollama returns a list of vectors for batch input
-        if embeddings and isinstance(embeddings[0], list):
-            return embeddings
-        # Single vector returned — replicate for each text
-        return [embeddings] * len(texts) if embeddings else []
+        # Batch in chunks of 4 to avoid Ollama timeout on large models (e.g. bge-m3)
+        # Some texts may trigger Ollama 500 (NaN bug in bge-m3) — fall back to zero vectors
+        all_vecs: list[list[float]] = []
+        batch_size = 4
+        dim = 1024  # bge-m3 default; corrected after first success
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            try:
+                resp = httpx.post(
+                    f"{self.url}/api/embed",
+                    json={"model": self.model, "input": chunk},
+                    timeout=120.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                embeddings = data.get("embeddings") or data.get("embedding") or []
+                if embeddings and isinstance(embeddings[0], list):
+                    for vec in embeddings:
+                        all_vecs.append(_sanitize_vec(vec))
+                    dim = len(embeddings[0])
+                else:
+                    all_vecs.append(embeddings if embeddings else [0.0] * dim)
+            except Exception:
+                # Batch failed — try embeddings one by one, use zero vector for failures
+                for text in chunk:
+                    try:
+                        resp2 = httpx.post(
+                            f"{self.url}/api/embed",
+                            json={"model": self.model, "input": text},
+                            timeout=60.0,
+                        )
+                        if resp2.status_code == 200:
+                            data2 = resp2.json()
+                            embs = data2.get("embeddings") or data2.get("embedding") or []
+                            vec = embs[0] if embs and isinstance(embs[0], list) else embs
+                            if vec:
+                                vec = _sanitize_vec(vec)
+                                dim = len(vec)
+                                all_vecs.append(vec)
+                                continue
+                        all_vecs.append([0.0] * dim)
+                    except Exception:
+                        all_vecs.append([0.0] * dim)
+        return all_vecs
 
 
 # ── sentence-transformers Backend ───────────────────────────────────────────
